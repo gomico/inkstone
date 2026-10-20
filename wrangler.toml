@@ -25,6 +25,7 @@ run_worker_first = [
 [[d1_databases]]
 binding = "DB"
 database_name = "inkstone-db"
+database_id = "29ce3719-b1ee-4228-90b1-ce2817a33957"
 
 [[r2_buckets]]
 binding = "FILES"
@@ -32,6 +33,7 @@ bucket_name = "inkstone-files"
 
 [[kv_namespaces]]
 binding = "OAUTH_KV"
+id = "2475108e571544dcbcadaa7b25d0c659"
 
 [[durable_objects.bindings]]
 name = "SYNC_HUB"
@@ -57,6 +59,7 @@ crons = ["0 * * * *", "15,45 * * * *"]
 
 [vars]
 APP_NAME = "Inkstone"
+PUBLIC_URL = "https://inkstone.smiku295.workers.dev"
 
 [observability]
 enabled = true
