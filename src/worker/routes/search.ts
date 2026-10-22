@@ -500,28 +500,60 @@ searchRoutes.get('/graph', requireAuth, async (c) => {
   const unresolved = new Map<string, { title: string; sources: Set<string> }>()
   const tagsByNote = new Map<string, Array<{ name: string; color: string | null }>>()
   if (ids.length) {
-    const placeholders = ids.map(() => '?').join(',')
-    const [linkResult, tagResult] = await Promise.all([
-      c.env.DB.prepare(
-        `SELECT source_note_id, target_note_id, target_key, target_title FROM links
-         WHERE user_id = ? AND source_note_id IN (${placeholders})
-           AND (target_note_id IN (${placeholders})${includeUnresolved ? ' OR target_note_id IS NULL' : ''})
-         ORDER BY source_note_id ASC, target_key ASC LIMIT ?`,
-      ).bind(userId, ...ids, ...ids, GRAPH_EDGE_CANDIDATE_LIMIT + 1).all<{
-        source_note_id: string
-        target_note_id: string | null
-        target_key: string
-        target_title: string
-      }>(),
-      c.env.DB.prepare(
-        `SELECT nt.note_id, t.name, t.color FROM note_tags nt
-         JOIN tags t ON t.id = nt.tag_id AND t.user_id = ?
-         WHERE nt.note_id IN (${placeholders}) ORDER BY t.name COLLATE NOCASE ASC`,
-      ).bind(userId, ...ids).all<{ note_id: string; name: string; color: string | null }>(),
+    // D1 rejects statements with more than 100 bound parameters ("too many SQL variables").
+    // The link query binds the id list twice, so large libraries must be queried in chunks:
+    // 1 (user_id) + 2 * 48 + 1 (limit) = 98 parameters per statement.
+    const LINK_ID_CHUNK = 48
+    const TAG_ID_CHUNK = 96
+    const chunkIds = (size: number): string[][] => {
+      const batches: string[][] = []
+      for (let index = 0; index < ids.length; index += size) batches.push(ids.slice(index, index + size))
+      return batches
+    }
+    const [linkBatches, tagBatches] = await Promise.all([
+      Promise.all(
+        chunkIds(LINK_ID_CHUNK).map((batch) => {
+          const placeholders = batch.map(() => '?').join(',')
+          return c.env.DB.prepare(
+            `SELECT source_note_id, target_note_id, target_key, target_title FROM links
+             WHERE user_id = ? AND source_note_id IN (${placeholders})
+               AND (target_note_id IN (${placeholders})${includeUnresolved ? ' OR target_note_id IS NULL' : ''})
+             ORDER BY source_note_id ASC, target_key ASC LIMIT ?`,
+          ).bind(userId, ...batch, ...batch, GRAPH_EDGE_CANDIDATE_LIMIT + 1).all<{
+            source_note_id: string
+            target_note_id: string | null
+            target_key: string
+            target_title: string
+          }>()
+        }),
+      ),
+      Promise.all(
+        chunkIds(TAG_ID_CHUNK).map((batch) => {
+          const placeholders = batch.map(() => '?').join(',')
+          return c.env.DB.prepare(
+            `SELECT nt.note_id, t.name, t.color FROM note_tags nt
+             JOIN tags t ON t.id = nt.tag_id AND t.user_id = ?
+             WHERE nt.note_id IN (${placeholders}) ORDER BY t.name COLLATE NOCASE ASC`,
+          ).bind(userId, ...batch).all<{ note_id: string; name: string; color: string | null }>()
+        }),
+      ),
     ])
-    if (linkResult.results.length > GRAPH_EDGE_CANDIDATE_LIMIT) truncated = true
+    const linkRows = linkBatches
+      .flatMap((result) => result.results)
+      .sort((a, b) => {
+        if (a.source_note_id !== b.source_note_id) return a.source_note_id < b.source_note_id ? -1 : 1
+        if (a.target_key === b.target_key) return 0
+        return a.target_key < b.target_key ? -1 : 1
+      })
+    const tagResults = tagBatches
+      .flatMap((result) => result.results)
+      .sort((a, b) => {
+        if (a.note_id !== b.note_id) return a.note_id < b.note_id ? -1 : 1
+        return a.name.localeCompare(b.name)
+      })
+    if (linkRows.length > GRAPH_EDGE_CANDIDATE_LIMIT) truncated = true
     const seen = new Set<string>()
-    for (const link of linkResult.results.slice(0, GRAPH_EDGE_CANDIDATE_LIMIT)) {
+    for (const link of linkRows.slice(0, GRAPH_EDGE_CANDIDATE_LIMIT)) {
       if (link.target_note_id === null) {
         if (!includeUnresolved || unresolved.size >= 50 && !unresolved.has(link.target_key)) continue
         const current = unresolved.get(link.target_key) ?? {
@@ -538,7 +570,7 @@ searchRoutes.get('/graph', requireAuth, async (c) => {
       seen.add(key)
       edges.push({ source: link.source_note_id, target: link.target_note_id })
     }
-    for (const item of tagResult.results) {
+    for (const item of tagResults) {
       const values = tagsByNote.get(item.note_id) ?? []
       values.push({ name: item.name, color: item.color })
       tagsByNote.set(item.note_id, values)
